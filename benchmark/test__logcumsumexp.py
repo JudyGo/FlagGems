@@ -15,6 +15,8 @@
 import pytest
 import torch
 
+import flag_gems
+
 from . import base, consts
 
 
@@ -33,6 +35,12 @@ def _logcumsumexp_case_fn(shape, dtype):
 
 def _logcumsumexp_build_inputs_fn(plan, dtype, device):
     (shape,) = plan.builder_args
+    if (
+        flag_gems.vendor_name == "mthreads"
+        and dtype == torch.bfloat16
+        and torch.Size(shape).numel() != 0
+    ):
+        pytest.skip("MUSA native logcumsumexp does not support nonempty BFloat16")
     return next(_logcumsumexp_input_fn(shape, dtype, device))
 
 
