@@ -1,12 +1,17 @@
+import inspect
+import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 import torch
 
 import flag_gems
+from flag_gems.runtime import torch_device_fn
 
 from . import accuracy_utils as utils
 
@@ -27,6 +32,17 @@ _ACCUMULATE_ATOL = {
     torch.bfloat16: 1e-1,
     torch.float32: 1e-4,
 }
+
+
+def _assert_put_equal(actual, expected, dtype):
+    # Preserve the target contract before observing exact values on CPU.
+    target = torch.device(flag_gems.device)
+    if target.type != "cpu" and target.index is None:
+        target = torch.device(target.type, torch_device_fn.current_device())
+    assert actual.device == target
+    assert actual.dtype == dtype
+    assert actual.shape == expected.shape
+    utils.gems_assert_equal(actual.cpu(), expected.cpu().to(dtype))
 
 
 def accumulate_atol(dtype):
@@ -149,7 +165,7 @@ def test_put__non_contiguous_narrow_accumulate(dtype, layout):
         "row_slice": lambda t: t[::2],
     }[layout](base)
     assert not inp.is_contiguous()
-    ref_inp = utils.to_reference(inp.clone(), True)
+    ref_inp = utils.to_reference(inp.clone(), False)
 
     numel = inp.numel()
     index = torch.randint(
@@ -157,11 +173,13 @@ def test_put__non_contiguous_narrow_accumulate(dtype, layout):
     )
     source = _gen_typed((index.numel(),), dtype, flag_gems.device)
 
-    ref_inp.put_(utils.to_reference(index), utils.to_reference(source, True), accumulate=True)
+    ref_inp.put_(
+        utils.to_reference(index), utils.to_reference(source, False), accumulate=True
+    )
     res = flag_gems.put_(inp, index, source, accumulate=True)
 
     assert res is inp
-    utils.gems_assert_equal(inp, ref_inp)
+    _assert_put_equal(inp, ref_inp, dtype)
 
 
 @pytest.mark.put_
@@ -276,7 +294,8 @@ def test_put__dtypes(dtype, accumulate):
     utils.init_seed(0)
     numel = 64
     inp = _gen_typed((numel,), dtype, flag_gems.device)
-    ref_inp = utils.to_reference(inp.clone(), True)
+    upcast = dtype.is_floating_point or dtype.is_complex
+    ref_inp = utils.to_reference(inp.clone(), upcast)
 
     # Duplicate indices only when accumulating: with `accumulate=False` a
     # repeated index is last-writer-wins and ATen does not specify the winner.
@@ -290,7 +309,7 @@ def test_put__dtypes(dtype, accumulate):
     source = _gen_typed((count,), dtype, flag_gems.device)
 
     ref_index = utils.to_reference(index)
-    ref_source = utils.to_reference(source, True)
+    ref_source = utils.to_reference(source, upcast)
 
     ref_inp.put_(ref_index, ref_source, accumulate=accumulate)
     res = flag_gems.put_(inp, index, source, accumulate=accumulate)
@@ -302,7 +321,7 @@ def test_put__dtypes(dtype, accumulate):
     if accumulate and (dtype.is_floating_point or dtype.is_complex):
         utils.gems_assert_close(inp, ref_inp, dtype, atol=accumulate_atol(dtype))
     else:
-        utils.gems_assert_equal(inp, ref_inp)
+        _assert_put_equal(inp, ref_inp, dtype)
 
 
 @pytest.mark.put_
@@ -313,18 +332,20 @@ def test_put__narrow_int_accumulate_wraparound(dtype):
     info = torch.iinfo(dtype)
     for init in [0, info.max - 3, info.min + 3]:
         inp = torch.full((4,), init, dtype=dtype, device=flag_gems.device)
-        ref_inp = utils.to_reference(inp.clone(), True)
+        ref_inp = utils.to_reference(inp.clone(), False)
 
         n = 20
         index = torch.zeros(n, dtype=torch.int64, device=flag_gems.device)
         source = torch.ones(n, dtype=dtype, device=flag_gems.device)
 
         ref_inp.put_(
-            utils.to_reference(index), utils.to_reference(source, True), accumulate=True
+            utils.to_reference(index),
+            utils.to_reference(source, False),
+            accumulate=True,
         )
         flag_gems.put_(inp, index, source, accumulate=True)
 
-        utils.gems_assert_equal(inp, ref_inp)
+        _assert_put_equal(inp, ref_inp, dtype)
 
 
 @pytest.mark.put_
@@ -335,17 +356,19 @@ def test_put__bool_accumulate_is_logical_or():
         for k in [1, 2, 3, 257]:
             inp = torch.zeros(2, dtype=torch.bool, device=flag_gems.device)
             inp[0] = init
-            ref_inp = utils.to_reference(inp.clone(), True)
+            ref_inp = utils.to_reference(inp.clone(), False)
 
             index = torch.zeros(k, dtype=torch.int64, device=flag_gems.device)
             source = torch.ones(k, dtype=torch.bool, device=flag_gems.device)
 
             ref_inp.put_(
-                utils.to_reference(index), utils.to_reference(source, True), accumulate=True
+                utils.to_reference(index),
+                utils.to_reference(source, False),
+                accumulate=True,
             )
             flag_gems.put_(inp, index, source, accumulate=True)
 
-            utils.gems_assert_equal(inp, ref_inp)
+            _assert_put_equal(inp, ref_inp, torch.bool)
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +396,7 @@ def test_put__high_rank(rank, contiguous):
     res = flag_gems.put_(inp, index, source)
     assert res is inp
 
-    utils.gems_assert_equal(inp, ref_inp)
+    _assert_put_equal(inp, ref_inp, torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -406,42 +429,224 @@ def test_put__empty_index_is_noop(self_numel):
     res = flag_gems.put_(inp, index, source)
     assert res is inp
 
-    utils.gems_assert_equal(inp, ref_inp)
+    _assert_put_equal(inp, ref_inp, torch.float32)
 
 
 @pytest.mark.put_
 @pytest.mark.parametrize("bad", [4, 5, 100, -5, -100])
-def test_put__index_out_of_range(bad):
+def test_put__index_out_of_range(bad, request):
+    if flag_gems.vendor_name == "mthreads":
+        pytest.skip("MUSA native put_ does not enforce device-side index bounds")
+
+    # A real valid-boundary control also exercises the currently injected root
+    # in this process. The isolated negative call below must use that same root.
+    inp = torch.zeros(4, dtype=torch.float32, device=flag_gems.device)
+    index = torch.tensor([-1 if bad < 0 else 0], device=inp.device)
+    source = torch.ones(1, dtype=inp.dtype, device=inp.device)
+    expected = torch.zeros(4, dtype=inp.dtype)
+    expected.put_(index.cpu(), source.cpu())
+    original_ptr = inp.data_ptr()
+    result = flag_gems.put_(inp, index, source)
+    assert result is inp
+    assert result.data_ptr() == original_ptr
+    _assert_put_equal(result, expected, torch.float32)
+
     # ATen's CUDA `put_` enforces `-numel <= index < numel` with a *device-side*
     # assert, and our kernel mirrors it with an unconditional device trap rather
     # than `tl.device_assert` (which is compiled out unless TRITON_DEBUG=1).
     # A tripped device assert poisons the CUDA context for the whole process, so
     # the failure is exercised in an isolated subprocess.
-    code = textwrap.dedent(f"""
+    from flag_gems.cli_override import load_override_config, parse_override_spec
+
+    overrides = {}
+    options = request.config.option
+    if getattr(options, "override_config", None):
+        overrides.update(load_override_config(options.override_config))
+    for spec in getattr(options, "override", None) or ():
+        name, filename, function = parse_override_spec(spec)
+        overrides[name] = (filename, function)
+    selected = overrides.get("put_")
+    if selected is not None:
+        selected = (str(Path(selected[0]).resolve()), selected[1])
+
+    def binding(function):
+        function = inspect.unwrap(function)
+        code = getattr(function, "__code__", None)
+        return {
+            "module": getattr(function, "__module__", None),
+            "qualname": getattr(function, "__qualname__", None),
+            "file": str(Path(code.co_filename).resolve()) if code else None,
+        }
+
+    payload = {
+        "bad": bad,
+        "override": selected,
+        "ref_cpu": utils.TO_CPU,
+        "binding": binding(flag_gems.put_),
+    }
+    code = textwrap.dedent("""
+        import inspect
+        import json
+        import sys
+        import traceback
+        from pathlib import Path
+
         import torch
         import flag_gems
+        from flag_gems.dynamic_registry import DynamicOpOverride
+        from flag_gems.runtime import torch_device_fn
+        from tests import conftest as cfg
 
+        payload = json.loads(sys.argv[1])
+        cfg.TO_CPU = payload["ref_cpu"]
+        from tests import accuracy_utils as child_utils
+        child_utils.TO_CPU = payload["ref_cpu"]
+        registry = DynamicOpOverride()
+        if payload["override"] is not None:
+            filename, function = payload["override"]
+            assert registry.override_from_file("put_", filename, function)
+
+        function = inspect.unwrap(flag_gems.put_)
+        source_code = getattr(function, "__code__", None)
+        actual_binding = {
+            "module": getattr(function, "__module__", None),
+            "qualname": getattr(function, "__qualname__", None),
+            "file": (
+                str(Path(source_code.co_filename).resolve()) if source_code else None
+            ),
+        }
+        assert actual_binding == payload["binding"]
+        report = {
+            "bad": payload["bad"], "binding": actual_binding,
+            "ref_cpu": child_utils.TO_CPU, "valid_completed": False,
+            "valid_call_returned": False,
+        }
+        def device_fault(error):
+            if not isinstance(error, RuntimeError):
+                return False
+            first = str(error).partition(chr(10))[0].strip().lower()
+            return first in {
+                prefix + fault
+                for prefix in ("cuda error: ", "hip error: ")
+                for fault in (
+                    "device-side assert triggered",
+                    "unspecified launch failure",
+                    "an illegal instruction was encountered",
+                )
+            }
         inp = torch.zeros(4, dtype=torch.float32, device=flag_gems.device)
-        index = torch.tensor([{bad}], dtype=torch.int64, device=flag_gems.device)
+        index = torch.tensor(
+            [payload["bad"]], dtype=torch.int64, device=flag_gems.device
+        )
         source = torch.ones(1, dtype=torch.float32, device=flag_gems.device)
 
         # A valid index must not synchronize on the success path.
-        inp.put_(index[:0].new_zeros(0), source[:0])
-        inp.put_(index, source)
-        torch.cuda.synchronize()
-        print("NO_ERROR")
+        synchronize = torch_device_fn.synchronize
+        def unexpected_valid_sync(*args, **kwargs):
+            raise AssertionError("put_ synchronized its valid call")
+        report["phase"] = "valid"
+        try:
+            torch_device_fn.synchronize = unexpected_valid_sync
+            try:
+                valid = flag_gems.put_(inp, index[:0], source[:0])
+                report["valid_call_returned"] = True
+            finally:
+                torch_device_fn.synchronize = synchronize
+            assert valid is inp
+            assert valid.device == inp.device and valid.dtype == inp.dtype
+            assert valid.shape == inp.shape
+            # Complete the valid operation outside the candidate, so a delayed
+            # valid-call GPU failure cannot masquerade as the bounds failure.
+            synchronize()
+        except Exception as error:
+            report.update(
+                error_type=type(error).__name__, error=str(error),
+                device_assert=False, candidate_calls=registry.call_counts(),
+            )
+            print("PUT_INPLACE_BOUNDS_RESULT:" + json.dumps(report), flush=True)
+            traceback.print_exception(type(error), error, error.__traceback__)
+            sys.exit(2)
+        report["valid_completed"] = True
+        report["phase"] = "invalid"
+        try:
+            flag_gems.put_(inp, index, source)
+            torch_device_fn.synchronize()
+        except Exception as error:
+            report.update(error_type=type(error).__name__, error=str(error))
+            report["error_first_line"] = str(error).partition(chr(10))[0]
+            traceback.print_exception(type(error), error, error.__traceback__)
+            report["context_poisoned"] = False
+            try:
+                probe = torch.ones(1, device=inp.device)
+                probe.add_(1)
+                torch_device_fn.synchronize()
+            except RuntimeError as poison:
+                report["context_poisoned"] = device_fault(poison)
+                report["context_error"] = str(poison)
+                report["context_error_first_line"] = str(poison).partition(chr(10))[0]
+            report["device_assert"] = (
+                device_fault(error) and report["context_poisoned"]
+                and report["error_first_line"].strip().lower()
+                == report["context_error_first_line"].strip().lower()
+            )
+            report["candidate_calls"] = registry.call_counts()
+            print("PUT_INPLACE_BOUNDS_RESULT:" + json.dumps(report), flush=True)
+            sys.exit(86 if report["device_assert"] else 2)
+        else:
+            report.update(device_assert=False, context_poisoned=False,
+                          candidate_calls=registry.call_counts())
+            print("PUT_INPLACE_BOUNDS_RESULT:" + json.dumps(report), flush=True)
+            sys.exit(0)
         """)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
-    proc = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env
-    )
-    assert "NO_ERROR" not in proc.stdout, (
-        "an out-of-range index was silently accepted; "
-        f"stdout={proc.stdout!r} stderr={proc.stderr[-300:]!r}"
-    )
-    assert "device-side assert" in proc.stderr or "trap" in proc.stderr.lower(), (
-        "expected a device-side failure, got: " + proc.stderr[-300:]
-    )
+    command = [sys.executable, "-c", code, json.dumps(payload)]
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    ) as child:
+
+        def interrupt_wait(_signum, _frame):
+            raise KeyboardInterrupt("put_ bounds child wait terminated")
+
+        previous_sigterm = signal.signal(signal.SIGTERM, interrupt_wait)
+        try:
+            stdout, stderr = child.communicate(timeout=120)
+        except BaseException as error:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = child.communicate()
+            if isinstance(error, subprocess.TimeoutExpired):
+                pytest.fail("put_ bounds child timed out: " + stderr[-500:])
+            raise
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        reports = [
+            json.loads(line.partition(":")[2])
+            for line in stdout.splitlines()
+            if line.startswith("PUT_INPLACE_BOUNDS_RESULT:")
+        ]
+        assert len(reports) == 1, f"missing bounds report: {stdout!r} {stderr[-500:]!r}"
+        report = reports[0]
+        assert report["bad"] == bad
+        assert report["binding"] == payload["binding"]
+        assert report["ref_cpu"] == utils.TO_CPU
+        request.node.user_properties.append(
+            ("put_inplace_bounds_child", json.dumps(report, sort_keys=True))
+        )
+        assert report["valid_completed"]
+        assert report["phase"] == "invalid"
+        if selected is not None:
+            assert report["candidate_calls"].get("flag_gems.put_") == 2
+        assert child.returncode == 86 and report["device_assert"], (
+            "expected an actual device-side bounds failure after the valid call; "
+            f"returncode={child.returncode}, report={report}, stderr={stderr[-500:]!r}"
+        )
 
 
 @pytest.mark.put_
@@ -457,7 +662,7 @@ def test_put__index_boundary_valid(boundary):
     ref_inp.put_(utils.to_reference(index), utils.to_reference(source, True))
     flag_gems.put_(inp, index, source)
 
-    utils.gems_assert_equal(inp, ref_inp)
+    _assert_put_equal(inp, ref_inp, torch.float32)
 
 
 @pytest.mark.put_
@@ -556,7 +761,7 @@ def test_put__interleaved_views_allowed():
     ref_base[::2].put_(utils.to_reference(index), ref_base[1::2])
     flag_gems.put_(base[::2], index, base[1::2])
 
-    utils.gems_assert_equal(base, ref_base)
+    _assert_put_equal(base, ref_base, torch.float32)
 
 
 @pytest.mark.put_
@@ -569,7 +774,7 @@ def test_put__disjoint_views_same_storage():
     ref_base[0:4].put_(utils.to_reference(index), ref_base[8:12])
     flag_gems.put_(base[0:4], index, base[8:12])
 
-    utils.gems_assert_equal(base, ref_base)
+    _assert_put_equal(base, ref_base, torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -588,11 +793,13 @@ def test_put__strided_source(accumulate):
     index = torch.arange(8, dtype=torch.int64, device=flag_gems.device)
 
     ref_inp.put_(
-        utils.to_reference(index), utils.to_reference(source, True), accumulate=accumulate
+        utils.to_reference(index),
+        utils.to_reference(source, True),
+        accumulate=accumulate,
     )
     flag_gems.put_(inp, index, source, accumulate=accumulate)
 
-    utils.gems_assert_equal(inp, ref_inp)
+    _assert_put_equal(inp, ref_inp, torch.float32)
 
 
 @pytest.mark.put_
@@ -612,11 +819,13 @@ def test_put__strided_index(accumulate):
     source = torch.arange(1, 9, dtype=torch.float32, device=flag_gems.device)
 
     ref_inp.put_(
-        utils.to_reference(index), utils.to_reference(source, True), accumulate=accumulate
+        utils.to_reference(index),
+        utils.to_reference(source, True),
+        accumulate=accumulate,
     )
     flag_gems.put_(inp, index, source, accumulate=accumulate)
 
-    utils.gems_assert_equal(inp, ref_inp)
+    _assert_put_equal(inp, ref_inp, torch.float32)
 
 
 @pytest.mark.put_
@@ -633,11 +842,13 @@ def test_put__transposed_index_and_source(accumulate):
     )
 
     ref_inp.put_(
-        utils.to_reference(index), utils.to_reference(source, True), accumulate=accumulate
+        utils.to_reference(index),
+        utils.to_reference(source, True),
+        accumulate=accumulate,
     )
     flag_gems.put_(inp, index, source, accumulate=accumulate)
 
-    utils.gems_assert_equal(inp, ref_inp)
+    _assert_put_equal(inp, ref_inp, torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +883,7 @@ def test_put__view_of_larger_storage(make_view, base_numel, index_vals):
     assert res is view
 
     # Comparing the whole base catches both a wrong offset and a stray write.
-    utils.gems_assert_equal(base, ref_base)
+    _assert_put_equal(base, ref_base, torch.float32)
 
 
 @pytest.mark.put_
@@ -680,7 +891,9 @@ def test_put__complex32_rejected():
     # Native CUDA `put_` has no ComplexHalf kernel; `complex32` used to fall
     # through to the FP16 real-view path, silently succeeding where ATen raises.
     factory_device = (
-        "cpu" if flag_gems.vendor_name == "kunlunxin" else flag_gems.device
+        "cpu"
+        if flag_gems.vendor_name in ("kunlunxin", "mthreads")
+        else flag_gems.device
     )
     inp = torch.zeros(4, dtype=torch.complex32, device=factory_device).to(
         flag_gems.device
@@ -690,9 +903,11 @@ def test_put__complex32_rejected():
         flag_gems.device
     )
 
-    with pytest.raises(NotImplementedError) as ref_err:
+    # RuntimeError vs. NotImplementedError varies with the backend/PyTorch
+    # version; the candidate must retain the native family and exact message.
+    with pytest.raises(RuntimeError, match="not implemented.*ComplexHalf") as ref_err:
         inp.clone().put_(index, source)
-    with pytest.raises(NotImplementedError) as res_err:
+    with pytest.raises(type(ref_err.value)) as res_err:
         flag_gems.put_(inp, index, source)
 
     assert str(ref_err.value) == str(res_err.value)
