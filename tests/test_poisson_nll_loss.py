@@ -23,6 +23,53 @@ from . import conftest as cfg
 SHAPES = [(2, 3)] if cfg.QUICK_MODE else [(2, 3), (128, 256), (512, 512)]
 
 
+def _poisson_ones(shape, dtype):
+    if flag_gems.vendor_name == "kunlunxin" and dtype == torch.float64:
+        value = torch.ones(shape, dtype=dtype, device="cpu")
+        return (
+            value.reshape(-1)
+            .view(torch.uint8)
+            .to(flag_gems.device)
+            .view(dtype)
+            .reshape(shape)
+        )
+    return torch.ones(shape, dtype=dtype, device=flag_gems.device)
+
+
+def _poisson_reference_input(value):
+    if (
+        utils.TO_CPU
+        and flag_gems.vendor_name == "kunlunxin"
+        and value.dtype == torch.float64
+    ):
+        return (
+            value.reshape(-1)
+            .view(torch.uint8)
+            .cpu()
+            .view(value.dtype)
+            .reshape(value.shape)
+        )
+    return utils.to_reference(value)
+
+
+def _complex_reference(inp, target, log_input, full, eps, reduction):
+    try:
+        return torch.ops.aten.poisson_nll_loss(
+            inp, target, log_input, full, eps, reduction
+        )
+    except (RuntimeError, ValueError) as error:
+        if (
+            flag_gems.vendor_name == "kunlunxin"
+            and inp.device.type != "cpu"
+            and (inp.is_complex() or target.is_complex())
+            and str(error).startswith("[NOT IMPLEMENTED]: error code= 4(")
+        ):
+            pytest.skip(
+                "Kunlunxin native Poisson NLL does not support this complex configuration; CPU reference remains covered"
+            )
+        raise
+
+
 @pytest.mark.poisson_nll_loss
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
@@ -115,11 +162,19 @@ def test_accuracy_poisson_nll_loss_boundary(dtype):
 def test_poisson_nll_loss_mixed_dtype_promotion(
     input_dtype, target_dtype, expected_dtype
 ):
-    input = torch.ones((2, 3), dtype=input_dtype, device=flag_gems.device)
-    target = torch.ones((1, 3), dtype=target_dtype, device=flag_gems.device)
+    input = _poisson_ones((2, 3), input_dtype)
+    target = _poisson_ones((1, 3), target_dtype)
+    if (
+        flag_gems.vendor_name == "kunlunxin"
+        and not utils.TO_CPU
+        and target_dtype == torch.float64
+    ):
+        pytest.skip(
+            "Kunlunxin native Poisson NLL rejects the mixed float32/float64 configuration; CPU reference remains covered"
+        )
     ref = torch.ops.aten.poisson_nll_loss(
-        utils.to_reference(input),
-        utils.to_reference(target),
+        _poisson_reference_input(input),
+        _poisson_reference_input(target),
         True,
         False,
         1e-8,
@@ -128,7 +183,19 @@ def test_poisson_nll_loss_mixed_dtype_promotion(
     result = flag_gems.poisson_nll_loss(input, target, True, False, 1e-8, 0)
     assert result.dtype == expected_dtype
     assert ref.dtype == expected_dtype
-    utils.gems_assert_close(result, ref, expected_dtype)
+    if flag_gems.vendor_name == "kunlunxin" and expected_dtype == torch.float64:
+        assert result.device == input.device
+        assert result.shape == ref.shape
+        observed = (
+            result.reshape(-1)
+            .view(torch.uint8)
+            .cpu()
+            .view(result.dtype)
+            .reshape(result.shape)
+        )
+        utils.gems_assert_close(observed, ref.cpu(), expected_dtype)
+    else:
+        utils.gems_assert_close(result, ref, expected_dtype)
 
 
 @pytest.mark.poisson_nll_loss
@@ -208,7 +275,7 @@ def test_poisson_nll_loss_complex(dtype, log_input, reduction, case):
     elif case == "real_target":
         target = target.real.abs() + 0.5
     full = case == "real_target"
-    reference = torch.ops.aten.poisson_nll_loss(
+    reference = _complex_reference(
         utils.to_reference(inp),
         utils.to_reference(target),
         log_input,
@@ -220,8 +287,9 @@ def test_poisson_nll_loss_complex(dtype, log_input, reduction, case):
     assert result.device == inp.device
     assert result.dtype == reference.dtype
     assert result.shape == reference.shape
-    # NPU complex arithmetic works, but its isfinite comparison kernel does not.
-    if flag_gems.vendor_name == "ascend":
+    if flag_gems.vendor_name == "ascend" or (
+        flag_gems.vendor_name == "kunlunxin" and result.is_complex()
+    ):
         result, reference = result.cpu(), reference.cpu()
     utils.gems_assert_close(
         result,
@@ -234,14 +302,14 @@ def test_poisson_nll_loss_complex(dtype, log_input, reduction, case):
 
 @pytest.mark.poisson_nll_loss
 def test_poisson_nll_loss_complex_target_full_rejected():
-    factory_device = "cpu" if flag_gems.vendor_name == "ascend" else flag_gems.device
-    inp = torch.ones(3, dtype=torch.complex64, device=factory_device).to(
-        flag_gems.device
-    )
-    with pytest.raises(RuntimeError):
+    inp = torch.ones(3, dtype=torch.complex64, device="cpu").to(flag_gems.device)
+    with pytest.raises((RuntimeError, ValueError)) as error:
         torch.ops.aten.poisson_nll_loss(
             utils.to_reference(inp), utils.to_reference(inp), True, True, 1e-8, 0
         )
+    if isinstance(error.value, ValueError):
+        assert flag_gems.vendor_name == "kunlunxin" and not utils.TO_CPU
+        assert str(error.value).startswith("[NOT IMPLEMENTED]: error code= 4(")
     with pytest.raises(RuntimeError):
         flag_gems.poisson_nll_loss(inp, inp, True, True, 1e-8, 0)
 

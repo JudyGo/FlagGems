@@ -24,12 +24,6 @@ def _input_fn(shape, dtype, device):
     yield input, target, True, False, 1e-8, 1
 
 
-def _torch_poisson_nll_loss(input, target, log_input, full, eps, reduction):
-    return torch.ops.aten.poisson_nll_loss(
-        input, target, log_input, full, eps, reduction
-    )
-
-
 def _case_fn(shape, dtype):
     yield base.BenchmarkCasePlan(
         shape={"input": shape, "target": shape},
@@ -60,7 +54,7 @@ def test_poisson_nll_loss():
         case_fn=_case_fn,
         build_inputs_fn=_build_inputs,
         op_name="poisson_nll_loss",
-        torch_op=_torch_poisson_nll_loss,
+        torch_op=torch.ops.aten.poisson_nll_loss.default,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
