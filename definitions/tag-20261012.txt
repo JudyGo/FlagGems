@@ -1,0 +1,10 @@
+avg_pool3d
+conv_transpose3d
+conv_transpose1d
+masked_softmax_backward
+masked_softmax
+native_multi_head_attention
+batch_norm_backward_reduce
+batch_norm_backward_elemt
+addmm_activation
+addbmm
